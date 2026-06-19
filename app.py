@@ -5,8 +5,6 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 from datetime import datetime
-from email.parser import BytesParser
-from email.policy import default as email_policy
 import html
 import json
 import os
@@ -330,12 +328,109 @@ def render_page(content, *, title=APP_NAME, active="dashboard"):
     return f"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{esc(title)}</title><link rel="stylesheet" href="/static/style.css"></head><body><aside class="sidebar"><div class="brand"><span>◆</span><strong>DocForge</strong><small>Local File OS</small></div><nav>{nav}</nav></aside><main class="shell">{content}</main></body></html>"""
 
 
+def parse_header_params(value):
+    parts = [part.strip() for part in value.split(";")]
+    params = {}
+    for part in parts[1:]:
+        if "=" not in part:
+            continue
+        key, raw = part.split("=", 1)
+        params[key.strip().lower()] = raw.strip().strip('"')
+    return parts[0].lower(), params
+
+
+def parse_multipart_form(handler):
+    content_type = handler.headers.get("Content-Type", "")
+    media_type, params = parse_header_params(content_type)
+    boundary = params.get("boundary")
+    if media_type != "multipart/form-data" or not boundary:
+        raise ValueError("Content-Type multipart/form-data invalido")
+
+    try:
+        content_length = int(handler.headers.get("Content-Length", "0"))
+    except ValueError as exc:
+        raise ValueError("Content-Length invalido") from exc
+    if content_length <= 0:
+        raise ValueError("Corpo da requisicao vazio")
+
+    body = handler.rfile.read(content_length)
+    delimiter = b"--" + boundary.encode("utf-8")
+    result = {"fields": {}, "files": []}
+
+    for part in body.split(delimiter):
+        part = part.strip()
+        if not part or part == b"--":
+            continue
+        if part.endswith(b"--"):
+            part = part[:-2].rstrip()
+        if b"\r\n\r\n" in part:
+            raw_headers, content = part.split(b"\r\n\r\n", 1)
+            line_sep = b"\r\n"
+        elif b"\n\n" in part:
+            raw_headers, content = part.split(b"\n\n", 1)
+            line_sep = b"\n"
+        else:
+            continue
+
+        headers = {}
+        for line in raw_headers.split(line_sep):
+            if b":" not in line:
+                continue
+            key, value = line.split(b":", 1)
+            headers[key.decode("latin-1").strip().lower()] = value.decode("latin-1").strip()
+
+        disposition = headers.get("content-disposition", "")
+        _, disposition_params = parse_header_params(disposition)
+        name = disposition_params.get("name")
+        if not name:
+            continue
+
+        if content.endswith(b"\r\n"):
+            content = content[:-2]
+        elif content.endswith(b"\n"):
+            content = content[:-1]
+
+        filename = disposition_params.get("filename")
+        if filename is not None:
+            result["files"].append(
+                {
+                    "name": name,
+                    "filename": filename,
+                    "content_type": headers.get("content-type", "application/octet-stream"),
+                    "content": content,
+                }
+            )
+        else:
+            result["fields"][name] = content.decode("utf-8", errors="replace")
+
+    return result
+
+
 class DocForgeHandler(BaseHTTPRequestHandler):
     server_version = "DocForge/2.0"
 
     def send_html(self, content, status=200):
         body = content.encode("utf-8")
         self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+    def send_json(self, payload, status=200):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_upload_error(self, message, status=500):
+        if "application/json" in self.headers.get("Accept", ""):
+            return self.send_json({"error": message}, status=status)
+        content = f"""
+<section class=\"panel narrow\">
+  <h2>Falha no upload</h2>
+  <p class=\"empty\">{html.escape(message)}</p>
+  <a class=\"button\" href=\"/upload\">Tentar novamente</a>
+</section>"""
+        return self.send_html(render_page(content, title="Falha no upload - DocForge"), status=status)
 
     def redirect(self, location):
         self.send_response(303); self.send_header("Location", location); self.end_headers()
@@ -435,34 +530,37 @@ class DocForgeHandler(BaseHTTPRequestHandler):
         content = '<section class="panel narrow"><h1>Novo documento</h1><form class="stack" method="post" action="/upload" enctype="multipart/form-data"><label>Título<input name="title" required maxlength="140"></label><label>Descrição<textarea name="description" rows="4"></textarea></label><label>Tags<input name="tags" placeholder="contrato, fiscal, projeto"></label><label>Arquivo<input name="file" type="file" required></label><button type="submit">Salvar no DocForge</button></form></section>'
         self.send_html(render_page(content, title="Novo upload - DocForge", active="upload"))
 
-    def parse_multipart_form(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
-        header = f"Content-Type: {self.headers.get('Content-Type', '')}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
-        message = BytesParser(policy=email_policy).parsebytes(header + body)
-        fields, files = {}, {}
-        for part in message.iter_parts():
-            name = part.get_param("name", header="content-disposition")
-            filename = part.get_filename()
-            payload = part.get_payload(decode=True) or b""
-            if filename:
-                files[name] = {"filename": filename, "content_type": part.get_content_type(), "data": payload}
-            elif name:
-                fields[name] = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
-        return fields, files
-
     def handle_upload(self):
-        fields, files = self.parse_multipart_form()
-        file_item = files.get("file")
-        if not file_item or not file_item.get("filename"):
-            return self.send_error(400, "Arquivo obrigatório")
-        original = Path(file_item["filename"]).name
-        stored = f"{uuid.uuid4().hex}_{original}"
-        target = UPLOAD_DIR / stored
-        target.write_bytes(file_item["data"])
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("INSERT INTO documents (title, description, tags, stored_name, original_name, content_type, size, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)", ((fields.get("title") or original).strip()[:140], (fields.get("description") or "").strip(), (fields.get("tags") or "").strip(), stored, original, file_item.get("content_type") or "application/octet-stream", target.stat().st_size))
-        self.redirect("/upload")
+        try:
+            form = parse_multipart_form(self)
+            file_item = next((item for item in form["files"] if item["name"] == "file"), None)
+            if file_item is None or not file_item["filename"]:
+                return self.send_upload_error("Arquivo obrigatorio.", status=400)
+
+            original = Path(file_item["filename"].replace("\\", "/")).name
+            stored = f"{uuid.uuid4().hex}_{original}"
+            target = UPLOAD_DIR / stored
+            target.write_bytes(file_item["content"])
+
+            fields = form["fields"]
+            title = (fields.get("title") or original).strip()[:140]
+            description = (fields.get("description") or "").strip()
+            tags = (fields.get("tags") or "").strip()
+            content_type = file_item["content_type"] or "application/octet-stream"
+            size = target.stat().st_size
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO documents (title, description, tags, stored_name, original_name, content_type, size, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (title, description, tags, stored, original, content_type, size),
+                )
+            self.redirect("/upload")
+        except ValueError as exc:
+            self.send_upload_error(str(exc), status=400)
+        except Exception:
+            self.send_upload_error("Erro interno ao salvar o arquivo.", status=500)
 
     def handle_delete(self, doc_id):
         doc = db_one("SELECT * FROM documents WHERE id = ?", (doc_id,))

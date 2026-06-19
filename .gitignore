@@ -5,3 +5,6 @@ __pycache__/
 data/*.sqlite3
 data/uploads/*
 !data/uploads/.gitkeep
+
+# Relatórios locais gerados pelo DocForge
+logs/*.txt
